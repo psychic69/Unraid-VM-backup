@@ -1,0 +1,299 @@
+#!/bin/bash
+
+# --- Configuration ---
+# The mount point to be checked by the script.
+VM_MOUNTPOINT="/mnt/nvme_vm_cache"
+# Libvirt backup configuration
+LIBVERT_LOCATION="/etc/libvirt"
+VM_BACKUP_LOCATION="/mnt/user/backup/vm"
+# The number of backup snapshots to keep.
+SNAPSHOTS=10
+
+# Global variable for the log file path. It will be set by setup_logging().
+LOG_FILE=""
+
+# --- File Rotation Function ---
+# Rotates files in a specified directory based on a pattern, keeping a maximum number.
+#
+# @param {string} dir - The directory containing the files.
+# @param {string} pattern - The file pattern to match (e.g., "*.log", "libvirt-backup-*.tar.gz").
+# @param {integer} max_files - The maximum number of files to keep.
+# @return {integer} 0 for success.
+file_rotation() {
+    local dir="$1"
+    local pattern="$2"
+    local max_files="$3"
+
+    log_message "INFO: Performing file rotation for pattern '${pattern}' in directory '${dir}'. Max files to keep: ${max_files}."
+    
+    # Use find to safely count files matching the pattern.
+    local current_file_count
+    current_file_count=$(find "${dir}" -maxdepth 1 -type f -name "${pattern}" | wc -l)
+
+    if (( current_file_count > max_files )); then
+        local num_to_delete=$((current_file_count - max_files))
+        log_message "INFO: Found ${current_file_count} files, which exceeds the max of ${max_files}. Deleting the ${num_to_delete} oldest file(s)."
+        
+        # List files by modification time (oldest first), select the ones to delete, and remove them.
+        # Using find with -printf is more robust than ls for filenames with special characters.
+        find "${dir}" -maxdepth 1 -type f -name "${pattern}" -printf '%T@ %p\n' | sort -n | head -n "${num_to_delete}" | cut -d' ' -f2- | while read -r old_file; do
+            log_message "INFO: Deleting old file: '${old_file}'"
+            if ! rm -f "${old_file}"; then
+                log_message "WARNING: Failed to delete old file '${old_file}'."
+            fi
+        done
+    else
+        log_message "INFO: ${current_file_count} file(s) found. No rotation needed for pattern '${pattern}'."
+    fi
+    return 0
+}
+
+# --- Logging Setup Function ---
+# Initializes the logging environment, creates the log directory, and sets the
+# log file for the current run.
+#
+# @uses global VM_BACKUP_LOCATION
+# @uses global SNAPSHOTS
+# @uses global LOG_FILE
+# @return {integer} 0 for success, 1 for failure.
+setup_logging() {
+    local log_dir="${VM_BACKUP_LOCATION}/logs"
+
+    # First, ensure the base backup location is accessible.
+    if [ ! -d "${VM_BACKUP_LOCATION}" ] || [ ! -w "${VM_BACKUP_LOCATION}" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - FATAL: Base backup location '${VM_BACKUP_LOCATION}' does not exist or is not writable. Cannot setup logging." >&2
+        return 1
+    fi
+
+    # Create the log directory if it doesn't exist.
+    if ! mkdir -p "${log_dir}"; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - FATAL: Failed to create log directory '${log_dir}'." >&2
+        return 1
+    fi
+
+    # Verify the log directory is writable.
+    if [ ! -w "${log_dir}" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - FATAL: Log directory '${log_dir}' is not writable." >&2
+        return 1
+    fi
+
+    # Set the global LOG_FILE variable for this script execution.
+    LOG_FILE="${log_dir}/backup-$(date '+%Y-%m-%d_%H%M%S').log"
+    
+    # Create the log file immediately and check for success.
+    if ! touch "${LOG_FILE}"; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - FATAL: Could not create log file at '${LOG_FILE}'." >&2
+        # Unset LOG_FILE as it's not valid.
+        LOG_FILE=""
+        return 1
+    fi
+
+    # Call the dedicated file rotation function for the logs.
+    local max_logs=$((SNAPSHOTS * 2))
+    file_rotation "${log_dir}" "backup-*.log" "${max_logs}"
+
+    return 0
+}
+
+# --- Logging Function ---
+# A simple function to log messages to a specified file and to the console.
+# Relies on the global LOG_FILE variable being set by setup_logging().
+#
+# @param {string} Message - The message to be logged.
+log_message() {
+    local message="$1"
+    # Fallback to stderr if logging has not been initialized.
+    if [[ -z "${LOG_FILE}" ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - UNINITIALIZED_LOG - ${message}" >&2
+        return
+    fi
+    # Logs the message with a timestamp to both the console and the log file.
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - ${message}" | tee -a "${LOG_FILE}"
+}
+
+# --- Snapshot Variable Check Function ---
+# Validates that the SNAPSHOTS global variable is a non-zero integer.
+#
+# @uses global SNAPSHOTS
+# @return {integer} 0 for success, 1 for failure.
+snapshot_variable_check() {
+    log_message "INFO: Validating SNAPSHOTS variable."
+    if ! [[ "${SNAPSHOTS}" =~ ^[1-9][0-9]*$ ]]; then
+        log_message "ERROR: SNAPSHOTS variable must be a non-zero integer. Current value: '${SNAPSHOTS}'"
+        return 1
+    fi
+    log_message "INFO: SNAPSHOTS variable is valid, using ${SNAPSHOTS} Snapshots."
+    return 0
+}
+
+# --- Mount Check Function ---
+# Checks if a given mount point is valid and has the correct filesystem type (btrfs or xfs).
+#
+# @uses global VM_MOUNTPOINT - The path to the mount point.
+# @return {integer} 0 for success, 1 for failure.
+mount_check() {
+    log_message "INFO: Starting check for mount point: '${VM_MOUNTPOINT}'"
+
+    # Step 1: Check if the directory exists and is a valid mount point.
+    if ! mountpoint -q "${VM_MOUNTPOINT}"; then
+        log_message "ERROR: Path '${VM_MOUNTPOINT}' is not a valid mount point or does not exist."
+        return 1
+    fi
+    log_message "INFO: Mount point '${VM_MOUNTPOINT}' exists and is valid."
+
+    # Step 2: Check the filesystem type.
+    local fs_type
+    fs_type=$(findmnt -no FSTYPE "${VM_MOUNTPOINT}")
+    if [[ -z "${fs_type}" ]]; then
+        log_message "ERROR: Could not determine filesystem type for '${VM_MOUNTPOINT}'."
+        return 1
+    fi
+    log_message "INFO: Detected filesystem type is '${fs_type}'."
+
+    # Step 3: Validate the filesystem type.
+    if [[ "${fs_type}" == "btrfs" || "${fs_type}" == "xfs" ]]; then
+        log_message "SUCCESS: Filesystem type '${fs_type}' is acceptable."
+        return 0
+    else
+        log_message "ERROR: Filesystem type for '${VM_MOUNTPOINT}' is '${fs_type}'. It must be 'btrfs' or 'xfs'."
+        return 1
+    fi
+}
+
+# --- Libvirt Backup Function ---
+# Backs up libvirt configuration files and manages snapshot rotation.
+#
+# @uses global LIBVERT_LOCATION - Source directory for libvirt configs.
+# @uses global VM_BACKUP_LOCATION - Base directory for storing backups.
+# @uses global SNAPSHOTS - The number of snapshots to retain.
+# @return {integer} 0 for success, 1 for failure.
+libvirt_backup() {
+    log_message "INFO: Starting libvirt configuration backup..."
+
+    # Check 1: Verify source directory is readable.
+    if [ ! -r "${LIBVERT_LOCATION}" ]; then
+        log_message "ERROR: Libvirt location '${LIBVERT_LOCATION}' is not readable."
+        return 1
+    fi
+    log_message "INFO: Source directory '${LIBVERT_LOCATION}' is readable."
+
+    # Check 2: Verify backup destination exists and is writable, then create subdir.
+    local backup_subdir="${VM_BACKUP_LOCATION}/libvirt"
+    if ! mkdir -p "${backup_subdir}"; then
+        log_message "ERROR: Failed to create backup subdirectory '${backup_subdir}'."
+        return 1
+    fi
+    log_message "INFO: Backup destination '${backup_subdir}' is ready."
+
+    # Create the backup archive.
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d_%H%M%S')
+    local filename="libvirt-backup-${timestamp}.tar.gz"
+    local full_backup_path="${backup_subdir}/${filename}"
+
+    log_message "INFO: Creating backup archive: '${full_backup_path}'"
+    # Use -C to change directory, ensuring the tarball doesn't contain the absolute path.
+    if ! tar -czf "${full_backup_path}" -C "${LIBVERT_LOCATION}" .; then
+        log_message "ERROR: tar command failed to create backup for '${LIBVERT_LOCATION}'."
+        # Clean up partially created file on failure
+        rm -f "${full_backup_path}"
+        return 1
+    fi
+    log_message "INFO: Successfully created backup archive."
+
+    # Call the generic file rotation function for libvirt backups.
+    file_rotation "${backup_subdir}" "libvirt-backup-*.tar.gz" "${SNAPSHOTS}"
+    
+    log_message "SUCCESS: Libvirt backup completed successfully."
+    return 0
+}
+
+# --- VM Snapshot Function ---
+# Creates copy-on-write (reflink) snapshots of VM disk images and rotates them.
+#
+# @uses global VM_MOUNTPOINT - The base path where VM domains are stored.
+# @uses global SNAPSHOTS - The number of snapshots to retain per VM.
+# @return {integer} 0 for success, 1 for failure.
+vm_snapshot() {
+    log_message "INFO: Starting VM disk snapshot process..."
+    local domains_dir="${VM_MOUNTPOINT}/domains"
+
+    # Check 1: Ensure the domains directory exists.
+    if [ ! -d "${domains_dir}" ]; then
+        log_message "ERROR: VM domains directory '${domains_dir}' does not exist."
+        return 1
+    fi
+
+    # Find all first-level subdirectories (each is a VM).
+    find "${domains_dir}" -mindepth 1 -maxdepth 1 -type d | while read -r vm_dir; do
+        local vm_name
+        vm_name=$(basename "${vm_dir}")
+        log_message "INFO: Processing VM: ${vm_name}"
+
+        # Find each base disk image and process it individually.
+        find "${vm_dir}" -maxdepth 1 -type f -name "*.img" | while read -r disk_image; do
+            local disk_basename
+            disk_basename=$(basename "${disk_image}")
+            log_message "INFO: Processing disk: ${disk_basename}"
+
+            # Create a new snapshot for this specific disk.
+            local timestamp
+            timestamp=$(date '+%Y%m%d%H%M%S')
+            local snapshot_file="${disk_image}_snapshot_${timestamp}.fullsnap"
+            
+            log_message "INFO: Creating reflink snapshot for '${disk_image}' -> '${snapshot_file}'"
+            if ! cp -p --reflink=always "${disk_image}" "${snapshot_file}"; then
+                log_message "ERROR: Failed to create snapshot for '${disk_image}'."
+                # Continue to the next disk even if one fails.
+            else
+                log_message "INFO: Successfully created snapshot '${snapshot_file}'."
+            fi
+
+            # Perform snapshot rotation for the snapshots of the CURRENT disk image.
+            local rotation_pattern="${disk_basename}_snapshot_*.fullsnap"
+            file_rotation "${vm_dir}" "${rotation_pattern}" "${SNAPSHOTS}"
+        done
+    done
+
+    log_message "SUCCESS: VM disk snapshot process completed."
+    return 0
+}
+
+
+# --- Main Execution ---
+
+# Initialize logging first. If it fails, the script cannot proceed.
+if ! setup_logging; then
+    echo "CRITICAL: Logging setup failed. Aborting script." >&2
+    exit 1
+fi
+
+# Validate configuration variables.
+if ! snapshot_variable_check; then
+    log_message "ERROR: Configuration validation failed. Aborting script."
+    exit 1
+fi
+
+log_message "--- Running Mount Point Check ---"
+if ! mount_check; then
+    log_message "ERROR: Mount point check failed. Halting script."
+    exit 1 
+fi
+log_message "Mount point check passed successfully."
+
+
+log_message "--- Running Libvirt Backup ---"
+if ! libvirt_backup; then
+    log_message "ERROR: Libvirt backup failed. Please review the log file."
+    # exit 1
+fi
+log_message "Libvirt backup completed successfully."
+
+
+log_message "--- Running VM Snapshot ---"
+if ! vm_snapshot; then
+    log_message "ERROR: VM snapshot process failed. Please review the log file."
+    # exit 1
+fi
+log_message "VM snapshot process completed successfully."
+

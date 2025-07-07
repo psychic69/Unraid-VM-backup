@@ -1,0 +1,41 @@
+#!/bin/bash
+
+# A script to determine which virtual machines to back up.
+
+# Set the list of VMs to back up. Use "ALL" for all VMs,
+# or a comma-separated list of VM names.
+VM_BACKUP_LIST="idrive-vm,ackTRipper"
+
+# This function identifies the target VMs for backup.
+vm_backup_targets() {
+  # Get a list of all existing VM names.
+  VM_LIBRARY=$(virsh list --all | awk '{print $2}' | tail -n +3 | grep -v '^$')
+
+  if [[ "$VM_BACKUP_LIST" == "ALL" ]]; then
+    # If backing up all VMs, the final list is the entire library.
+    VM_BACKUP_FINAL="$VM_LIBRARY"
+  else
+    # Convert the comma-separated string into an array.
+    IFS=',' read -ra TEMP_ARRAY <<< "$VM_BACKUP_LIST"
+    
+    VM_BACKUP_FINAL=""
+    for vm in "${TEMP_ARRAY[@]}"; do
+      # Check if the specified VM exists in the library.
+      if ! grep -q "^$vm$" <<< "$VM_LIBRARY"; then
+        echo "Error: VM '$vm' not found in Unraid VM list. Exiting." >&2
+        exit 1
+      fi
+      # Add the valid VM to the final list, separated by newlines.
+      VM_BACKUP_FINAL+="$vm\n"
+    done
+    # Remove the trailing newline from the final list.
+    VM_BACKUP_FINAL=$(echo -e "$VM_BACKUP_FINAL" | sed '/^$/d')
+  fi
+
+  # Print the final list of VMs to be backed up.
+  echo -e "$VM_BACKUP_FINAL"
+}
+
+# Execute the function to determine and display the backup targets.
+vm_backup_targets
+
