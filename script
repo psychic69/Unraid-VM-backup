@@ -1,18 +1,22 @@
 #!/bin/bash
 
 # --- Global Variables (will be populated from parameters.ini) ---
+VM_SNAPSHOT_LIST=""
 VM_BACKUP_LIST=""
 VM_BACKUP_PRI_ONLY=""
 CREATE_BU_IMAGE=""
 SNAPSHOTS=""
 RETENTION_DAYS=""
 VM_MOUNTPOINT=""
+VM_BACKUP_MOUNTPOINT=""
 LIBVERT_LOCATION=""
 VM_BACKUP_LOCATION=""
-VM_BACKUP_LOCATION_USED_PCT=""
+FILESYSTEM_MAX_PCT=""
 SHARES_CONFIG_DIR=""
+DEBUG_MODE=""
 LOG_FILE=""
-VM_BACKUP_TARGETS="" # Will be populated by vm_backup_targets()
+VM_SNAPSHOT_TARGETS="" # Will be populated by determine_vm_targets()
+VM_BACKUP_TARGETS="" # Will be populated by determine_vm_targets()
 
 # --- Read Input File Function ---
 # Reads configuration parameters from an INI file located in the script's directory.
@@ -43,16 +47,19 @@ read_input_file() {
 
         # Assign value to the corresponding global variable
         case "${trimmed_key}" in
+            VM_SNAPSHOT_LIST) VM_SNAPSHOT_LIST="${trimmed_value}" ;;
             VM_BACKUP_LIST) VM_BACKUP_LIST="${trimmed_value}" ;;
             VM_BACKUP_PRI_ONLY) VM_BACKUP_PRI_ONLY="${trimmed_value}" ;;
             CREATE_BU_IMAGE) CREATE_BU_IMAGE="${trimmed_value}" ;;
             SNAPSHOTS) SNAPSHOTS="${trimmed_value}" ;;
             RETENTION_DAYS) RETENTION_DAYS="${trimmed_value}" ;;
             VM_MOUNTPOINT) VM_MOUNTPOINT="${trimmed_value}" ;;
+            VM_BACKUP_MOUNTPOINT) VM_BACKUP_MOUNTPOINT="${trimmed_value}" ;;
             LIBVERT_LOCATION) LIBVERT_LOCATION="${trimmed_value}" ;;
             VM_BACKUP_LOCATION) VM_BACKUP_LOCATION="${trimmed_value}" ;;
-            VM_BACKUP_LOCATION_USED_PCT) VM_BACKUP_LOCATION_USED_PCT="${trimmed_value}" ;;
+            FILESYSTEM_MAX_PCT) FILESYSTEM_MAX_PCT="${trimmed_value}" ;;
             SHARES_CONFIG_DIR) SHARES_CONFIG_DIR="${trimmed_value}" ;;
+            DEBUG_MODE) DEBUG_MODE="${trimmed_value}" ;;
         esac
     done < "${ini_file}"
 
@@ -198,8 +205,8 @@ validate_parameters() {
         log_message "ERROR: SNAPSHOTS must be a non-zero integer. Current value: '${SNAPSHOTS}'"
         has_error=1
     fi
-    if ! [[ "${VM_BACKUP_LOCATION_USED_PCT}" =~ ^[0-9]+$ ]] || [ "${VM_BACKUP_LOCATION_USED_PCT}" -gt 100 ]; then
-        log_message "ERROR: VM_BACKUP_LOCATION_USED_PCT must be an integer between 0-100. Current value: '${VM_BACKUP_LOCATION_USED_PCT}'"
+    if ! [[ "${FILESYSTEM_MAX_PCT}" =~ ^[0-9]+$ ]] || [ "${FILESYSTEM_MAX_PCT}" -gt 100 ]; then
+        log_message "ERROR: FILESYSTEM_MAX_PCT must be an integer between 0-100. Current value: '${FILESYSTEM_MAX_PCT}'"
         has_error=1
     fi
     if ! [[ "${RETENTION_DAYS}" =~ ^[0-9]+$ ]] || [ "${RETENTION_DAYS}" -lt 7 ] || [ "${RETENTION_DAYS}" -gt 365 ]; then
@@ -222,8 +229,10 @@ validate_parameters() {
     if ! check_YN "${VM_BACKUP_PRI_ONLY}" "VM_BACKUP_PRI_ONLY"; then
         has_error=1
     fi
-
     if ! check_YN "${CREATE_BU_IMAGE}" "CREATE_BU_IMAGE"; then
+        has_error=1
+    fi
+    if ! check_YN "${DEBUG_MODE}" "DEBUG_MODE"; then
         has_error=1
     fi
 
@@ -235,53 +244,59 @@ validate_parameters() {
     return 0
 }
 
-# --- VM Backup Targets Function ---
-# Determines the final list of VMs to be backed up based on the config file.
-# Sets the global VM_BACKUP_TARGETS variable.
+# --- Determine VM Targets Function ---
+# Determines the final list of VMs to process based on a config list.
 #
+# @param {string} result_var_name - The name of the global variable to set with the result.
+# @param {string} config_list - The configuration value (e.g., "ALL", "NONE", "vm1,vm2").
+# @param {string} target_type - A descriptive name for the log messages (e.g., "snapshot").
 # @return {integer} 0 for success, 1 for failure.
-vm_backup_targets() {
-    log_message "INFO: Determining VM backup targets..."
+determine_vm_targets() {
+    local result_var_name="$1"
+    local config_list="$2"
+    local target_type="$3"
     
-    # Get a list of all existing VM names from libvirt.
+    log_message "INFO: Determining VM ${target_type} targets..."
+    
+    if [[ "${config_list}" == "NONE" ]]; then
+        log_message "INFO: Configuration for ${target_type} is set to NONE. No targets will be processed."
+        printf -v "${result_var_name}" '' # Set the global variable to empty
+        return 0
+    fi
+    
     local vm_library
     vm_library=$(virsh list --all | awk '{print $2}' | tail -n +3 | grep -v '^$')
     if [ -z "${vm_library}" ]; then
-        log_message "WARNING: Could not retrieve any VMs from 'virsh list --all'."
-        # Not a fatal error, maybe no VMs are defined.
+        log_message "WARNING: Could not retrieve any VMs from 'virsh list --all'. No ${target_type} targets."
+        printf -v "${result_var_name}" ''
         return 0
     fi
 
-    if [[ "${VM_BACKUP_LIST}" == "ALL" ]]; then
-        log_message "INFO: Configuration set to back up ALL VMs."
-        VM_BACKUP_TARGETS="${vm_library}"
+    local final_list=""
+    if [[ "${config_list}" == "ALL" ]]; then
+        log_message "INFO: Configuration set to ${target_type} ALL VMs."
+        final_list="${vm_library}"
     else
-        log_message "INFO: Configuration set to back up specific VMs: ${VM_BACKUP_LIST}"
-        # Convert the comma-separated string into an array.
-        IFS=',' read -ra temp_array <<< "$VM_BACKUP_LIST"
+        log_message "INFO: Configuration set to ${target_type} specific VMs: ${config_list}"
+        IFS=',' read -ra temp_array <<< "$config_list"
         
-        local final_list=""
         for vm in "${temp_array[@]}"; do
-            # Check if the specified VM exists in the library.
             if ! grep -q "^${vm}$" <<< "${vm_library}"; then
-                log_message "ERROR: VM '${vm}' from config file not found in virsh list. Exiting."
+                log_message "ERROR: VM '${vm}' from config for ${target_type} not found in virsh list. Exiting."
                 return 1
             fi
-            # Add the valid VM to the final list, separated by newlines.
             final_list+="${vm}\n"
         done
-        # Remove the trailing newline from the final list.
-        VM_BACKUP_TARGETS=$(echo -e "${final_list}" | sed '/^$/d')
     fi
 
-    if [ -z "${VM_BACKUP_TARGETS}" ]; then
-        log_message "INFO: No VM backup targets were identified."
+    # Assign the processed list to the specified global variable
+    printf -v "${result_var_name}" '%s' "$(echo -e "${final_list}" | sed '/^$/d')"
+
+    if [ -z "${!result_var_name}" ]; then
+        log_message "INFO: No VM ${target_type} targets were identified."
     else
-        log_message "INFO: Final list of VMs to be processed:"
-        # Log each VM on a new line for clarity.
-        while IFS= read -r vm; do
-            log_message "INFO:  - ${vm}"
-        done <<< "${VM_BACKUP_TARGETS}"
+        log_message "INFO: Final list of VMs to be processed for ${target_type}:"
+        while IFS= read -r vm; do log_message "INFO:  - ${vm}"; done <<< "${!result_var_name}"
     fi
     
     return 0
@@ -290,32 +305,61 @@ vm_backup_targets() {
 # --- Mount Check Function ---
 # Checks if a given mount point is valid and has the correct filesystem type (btrfs or xfs).
 #
-# @uses global VM_MOUNTPOINT
+# @param {string} mount_path - The path to check.
 # @return {integer} 0 for success, 1 for failure.
 mount_check() {
-    log_message "INFO: Starting check for mount point: '${VM_MOUNTPOINT}'"
+    local mount_path="$1"
+    log_message "INFO: Starting check for mount point: '${mount_path}'"
 
-    if ! mountpoint -q "${VM_MOUNTPOINT}"; then
-        log_message "ERROR: Path '${VM_MOUNTPOINT}' is not a valid mount point or does not exist."
+    if ! mountpoint -q "${mount_path}"; then
+        log_message "ERROR: Path '${mount_path}' is not a valid mount point or does not exist."
         return 1
     fi
-    log_message "INFO: Mount point '${VM_MOUNTPOINT}' exists and is valid."
+    log_message "INFO: Mount point '${mount_path}' exists and is valid."
 
     local fs_type
-    fs_type=$(findmnt -no FSTYPE "${VM_MOUNTPOINT}")
+    fs_type=$(findmnt -no FSTYPE "${mount_path}")
     if [[ -z "${fs_type}" ]]; then
-        log_message "ERROR: Could not determine filesystem type for '${VM_MOUNTPOINT}'."
+        log_message "ERROR: Could not determine filesystem type for '${mount_path}'."
         return 1
     fi
-    log_message "INFO: Detected filesystem type is '${fs_type}'."
+    log_message "INFO: Detected filesystem type for '${mount_path}' is '${fs_type}'."
 
     if [[ "${fs_type}" == "btrfs" || "${fs_type}" == "xfs" ]]; then
         log_message "SUCCESS: Filesystem type '${fs_type}' is acceptable."
         return 0
     else
-        log_message "ERROR: Filesystem type for '${VM_MOUNTPOINT}' is '${fs_type}'. It must be 'btrfs' or 'xfs'."
+        log_message "ERROR: Filesystem type for '${mount_path}' is '${fs_type}'. It must be 'btrfs' or 'xfs'."
         return 1
     fi
+}
+
+# --- Filesystem Usage Check ---
+# Checks if the usage of a filesystem exceeds a given percentage.
+#
+# @param {string} fs_path - A path on the filesystem to check.
+# @param {integer} max_pct - The maximum allowed usage percentage.
+# @return {integer} 0 if usage is acceptable, 1 if it exceeds the max.
+filesystem_usage_check() {
+    local fs_path="$1"
+    local max_pct="$2"
+    log_message "INFO: Checking filesystem usage for path '${fs_path}' against max of ${max_pct}%."
+
+    local usage_pct
+    usage_pct=$(df --output=pcent "${fs_path}" | tail -n 1 | tr -d ' %')
+
+    if ! [[ "${usage_pct}" =~ ^[0-9]+$ ]]; then
+        log_message "ERROR: Could not determine filesystem usage percentage for '${fs_path}'."
+        return 1
+    fi
+
+    if (( usage_pct > max_pct )); then
+        log_message "ERROR: Filesystem usage for '${fs_path}' is at ${usage_pct}%, which exceeds the maximum allowed of ${max_pct}%."
+        return 1
+    fi
+
+    log_message "INFO: Filesystem usage is at ${usage_pct}%. Check passed."
+    return 0
 }
 
 # --- Libvirt Backup Function ---
@@ -360,12 +404,11 @@ libvirt_backup() {
 
 # --- VM Snapshot Function ---
 # Creates copy-on-write (reflink) snapshots of VM disk images and rotates them.
-# This function processes ALL VMs found in the domains directory.
 #
-# @uses global VM_MOUNTPOINT, SNAPSHOTS
+# @uses global VM_MOUNTPOINT, SNAPSHOTS, VM_SNAPSHOT_TARGETS
 # @return {integer} 0 for success, 1 for failure.
 vm_snapshot() {
-    log_message "INFO: Starting VM disk snapshot process for all VMs..."
+    log_message "INFO: Starting VM disk snapshot process..."
     local domains_dir="${VM_MOUNTPOINT}/domains"
 
     if [ ! -d "${domains_dir}" ]; then
@@ -373,10 +416,19 @@ vm_snapshot() {
         return 1
     fi
 
-    # Find all first-level subdirectories (each is a VM) and process them.
-    find "${domains_dir}" -mindepth 1 -maxdepth 1 -type d | while read -r vm_dir; do
-        local vm_name
-        vm_name=$(basename "${vm_dir}")
+    if [ -z "${VM_SNAPSHOT_TARGETS}" ]; then
+        log_message "INFO: No VMs targeted for snapshot. Skipping snapshot process."
+        return 0
+    fi
+
+    # Loop through the list of VMs determined by vm_snapshot_targets.
+    while IFS= read -r vm_name; do
+        local vm_dir="${domains_dir}/${vm_name}"
+        if [ ! -d "${vm_dir}" ]; then
+            log_message "WARNING: Directory for VM '${vm_name}' not found at '${vm_dir}'. Skipping."
+            continue
+        fi
+
         log_message "INFO: Processing VM: ${vm_name}"
 
         # Find each base disk image and process it individually.
@@ -399,9 +451,98 @@ vm_snapshot() {
             local rotation_pattern="${disk_basename}_snapshot_*.fullsnap"
             file_rotation "${vm_dir}" "${rotation_pattern}" "${SNAPSHOTS}" "${RETENTION_DAYS}"
         done
-    done
+    done <<< "${VM_SNAPSHOT_TARGETS}"
 
     log_message "SUCCESS: VM disk snapshot process completed."
+    return 0
+}
+
+# --- VM Backup Function ---
+# Prepares and validates the backup location for VM disk images.
+#
+# @return {integer} 0 for success, 1 for failure.
+vm_backup() {
+    log_message "INFO: --- Preparing for VM Backup ---"
+    
+    if [ -z "${VM_BACKUP_TARGETS}" ]; then
+        log_message "INFO: No VMs targeted for backup. Skipping backup process."
+        return 0
+    fi
+
+    local vm_disk_backup=""
+
+    # 1. Determine and validate the physical backup path.
+    if [[ "${VM_BACKUP_LOCATION}" == /mnt/user/* ]]; then
+        log_message "INFO: Backup location is on a user share. Translating path..."
+        
+        # 1a.1 & 1a.2: Extract share name and suffix.
+        local path_after_user="${VM_BACKUP_LOCATION#/mnt/user/}"
+        local backup_share="${path_after_user%%/*}"
+        local backup_share_suffix="${path_after_user#$backup_share}"
+        log_message "INFO: Detected Share: '${backup_share}', Suffix: '${backup_share_suffix}'"
+
+        # 1a.3: Check share config file.
+        local share_config_file="${SHARES_CONFIG_DIR}/${backup_share}.cfg"
+        if [ ! -r "${share_config_file}" ]; then
+            log_message "ERROR: Share config file not found or not readable: '${share_config_file}'"
+            return 1
+        fi
+
+        # 1a.3a: Validate 'shareInclude' parameter.
+        local share_include_lines
+        share_include_lines=$(grep '^shareInclude=' "${share_config_file}")
+        if [ "$(echo "${share_include_lines}" | wc -l)" -ne 1 ]; then
+            log_message "ERROR: Expected exactly one 'shareInclude' line in '${share_config_file}', but found $(echo "${share_include_lines}" | wc -l)."
+            return 1
+        fi
+
+        local backup_disk
+        backup_disk=$(echo "${share_include_lines}" | cut -d'=' -f2 | tr -d '"')
+        if [[ ! "${backup_disk}" == disk* ]]; then
+            log_message "ERROR: 'shareInclude' value in '${share_config_file}' is not in the format 'disk*'. Found: '${backup_disk}'"
+            return 1
+        fi
+        
+        if ! mountpoint -q "/mnt/${backup_disk}"; then
+            log_message "ERROR: The included disk '${backup_disk}' is not mounted at '/mnt/${backup_disk}'."
+            return 1
+        fi
+        log_message "INFO: Share config valid. Using physical disk: '${backup_disk}'"
+
+        # 1a.4: Set the final physical backup path.
+        vm_disk_backup="/mnt/${backup_disk}${backup_share_suffix}"
+
+    else
+        log_message "INFO: Backup location is on a direct disk or pool mount."
+        # 1b.1: Check if the mount point is valid.
+        if ! mount_check "${VM_BACKUP_MOUNTPOINT}"; then
+             log_message "ERROR: The specified VM_BACKUP_MOUNTPOINT '${VM_BACKUP_MOUNTPOINT}' is not a valid btrfs or xfs mount."
+             return 1
+        fi
+        # 1b.2: Set the final backup path.
+        vm_disk_backup="${VM_BACKUP_LOCATION}"
+    fi
+
+    log_message "INFO: Final physical backup path set to: '${vm_disk_backup}'"
+
+    # 2. Check if directory exists and is writable.
+    if ! mkdir -p "${vm_disk_backup}"; then
+        log_message "ERROR: Failed to create backup directory '${vm_disk_backup}'."
+        return 1
+    fi
+    if [ ! -w "${vm_disk_backup}" ]; then
+        log_message "ERROR: Backup directory '${vm_disk_backup}' is not writable."
+        return 1
+    fi
+    log_message "INFO: Backup directory is accessible and writable."
+
+    # 3. Check filesystem usage against the safety threshold.
+    if ! filesystem_usage_check "${vm_disk_backup}" "${FILESYSTEM_MAX_PCT}"; then
+        log_message "ERROR: Filesystem usage check failed. Halting backup to prevent filling the disk."
+        return 1
+    fi
+
+    log_message "SUCCESS: VM Backup preparation stage completed successfully."
     return 0
 }
 
@@ -425,16 +566,20 @@ if ! validate_parameters; then
     exit 1
 fi
 
-# Step 4: Determine which VMs to back up for backup location on external filesystem.
-if ! vm_backup_targets; then
+# Step 4: Determine which VMs to process for snapshots and backups.
+if ! determine_vm_targets "VM_SNAPSHOT_TARGETS" "${VM_SNAPSHOT_LIST}" "snapshot"; then
+    log_message "ERROR: Failed to determine valid VM snapshot targets. Aborting script."
+    exit 1
+fi
+if ! determine_vm_targets "VM_BACKUP_TARGETS" "${VM_BACKUP_LIST}" "backup"; then
     log_message "ERROR: Failed to determine valid VM backup targets. Aborting script."
     exit 1
 fi
 
 # --- Begin Backup Logic ---
-log_message "--- Running Mount Point Check ---"
-if ! mount_check; then
-    log_message "ERROR: Mount point check failed. Halting script."
+log_message "--- Running Mount Point Check for VM Source ---"
+if ! mount_check "${VM_MOUNTPOINT}"; then
+    log_message "ERROR: VM source mount point check failed. Halting script."
     exit 1 
 fi
 log_message "Mount point check passed successfully."
@@ -452,4 +597,10 @@ if ! vm_snapshot; then
     log_message "ERROR: VM snapshot process failed. Please review the log file."
 fi
 log_message "VM snapshot process completed successfully."
+
+log_message "--- Running VM Backup ---"
+if ! vm_backup; then
+    log_message "ERROR: VM backup process failed. Please review the log file."
+fi
+log_message "VM backup completed successfully."
 
