@@ -320,9 +320,18 @@ mount_check() {
     fi
     log_message "INFO: Detected filesystem type for '${mount_path}' is '${fs_type}'."
 
-    if [[ "${fs_type}" == "btrfs" || "${fs_type}" == "xfs" ]]; then
-        log_message "SUCCESS: Filesystem type '${fs_type}' is acceptable."
+    if [[ "${fs_type}" == "btrfs" ]]; then
+        log_message "SUCCESS: Filesystem type 'btrfs' is acceptable."
         return 0
+    elif [[ "${fs_type}" == "xfs" ]]; then
+        log_message "INFO: Filesystem is XFS. Checking for reflink support..."
+        if xfs_info "${mount_path}" | grep -q "reflink=1"; then
+            log_message "SUCCESS: XFS filesystem has reflink support enabled."
+            return 0
+        else
+            log_message "ERROR: XFS filesystem at '${mount_path}' is a legacy filesystem without reflink=1 support. Snapshots will fail."
+            return 1
+        fi
     else
         log_message "ERROR: Filesystem type for '${mount_path}' is '${fs_type}'. It must be 'btrfs' or 'xfs'."
         return 1
@@ -404,6 +413,13 @@ libvirt_backup() {
 # @return {integer} 0 for success, 1 for failure.
 vm_snapshot() {
     log_message "INFO: Starting VM disk snapshot process..."
+
+    # Safety Check: Ensure the destination filesystem is not too full before starting.
+    if ! filesystem_usage_check "${VM_MOUNTPOINT}" "${FILESYSTEM_MAX_PCT}"; then
+        log_message "ERROR: Filesystem usage check failed for snapshot destination '${VM_MOUNTPOINT}'. Halting snapshot process."
+        return 1
+    fi
+    
     local domains_dir="${VM_MOUNTPOINT}/domains"
 
     if [ ! -d "${domains_dir}" ]; then
@@ -499,8 +515,6 @@ vm_backup() {
         if [[ ! "${backup_disk}" == disk* ]]; then
             log_message "ERROR: 'shareInclude' value in '${share_config_file}' is not in the format 'disk*'. Found: '${backup_disk}'"
             return 1
-           else
-             log_message "INFO: The base filesystem disk is: ${backup_disk}"
         fi
         
         if ! mountpoint -q "/mnt/${backup_disk}"; then
@@ -508,6 +522,12 @@ vm_backup() {
             return 1
         fi
         log_message "INFO: Share config valid. Using physical disk: '${backup_disk}'"
+
+        # 1a. 4: Filesystem final check
+        if ! mount_check "/mnt/${backup_disk}"; then
+        log_message "ERROR: The final physical backup path '${vm_disk_backup}' is not a usable xfs or btrfs mount point."
+        return 1
+        fi
 
         # 1a.4: Set the final physical backup path.
         vm_disk_backup="/mnt/${backup_disk}/${path_after_user}"
@@ -525,7 +545,7 @@ vm_backup() {
 
     log_message "INFO: Final physical backup path set to: '${vm_disk_backup}'"
 
-    # 2. Check if directory exists and is writable.
+    # 3. Check if directory exists and is writable.
     if ! mkdir -p "${vm_disk_backup}"; then
         log_message "ERROR: Failed to create backup directory '${vm_disk_backup}'."
         return 1
@@ -536,7 +556,7 @@ vm_backup() {
     fi
     log_message "INFO: Backup directory is accessible and writable."
 
-    # 3. Check filesystem usage against the safety threshold.
+    # 4. Check filesystem usage against the safety threshold.
     if ! filesystem_usage_check "${vm_disk_backup}" "${FILESYSTEM_MAX_PCT}"; then
         log_message "ERROR: Filesystem usage check failed. Halting backup to prevent filling the disk."
         return 1
