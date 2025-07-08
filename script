@@ -4,7 +4,6 @@
 VM_SNAPSHOT_LIST=""
 VM_BACKUP_LIST=""
 VM_BACKUP_PRI_ONLY=""
-CREATE_BU_IMAGE=""
 SNAPSHOTS=""
 RETENTION_DAYS=""
 VM_MOUNTPOINT=""
@@ -39,18 +38,17 @@ read_input_file() {
         [[ "${key}" =~ ^\s*# ]] && continue
         [[ -z "${key}" ]] && continue
 
-        # Trim leading/trailing whitespace and quotes from key and value
+        # Trim leading/trailing whitespace, quotes, and carriage returns from key and value
         local trimmed_key
         trimmed_key=$(echo "${key}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
         local trimmed_value
-        trimmed_value=$(echo "${value}" | sed -e 's/^[[:space:]"]*//' -e 's/[[:space:]"]*$//')
+        trimmed_value=$(echo "${value}" | sed -e 's/^[[:space:]"]*//' -e 's/[[:space:]"]*$//' | tr -d '\r')
 
         # Assign value to the corresponding global variable
         case "${trimmed_key}" in
             VM_SNAPSHOT_LIST) VM_SNAPSHOT_LIST="${trimmed_value}" ;;
             VM_BACKUP_LIST) VM_BACKUP_LIST="${trimmed_value}" ;;
             VM_BACKUP_PRI_ONLY) VM_BACKUP_PRI_ONLY="${trimmed_value}" ;;
-            CREATE_BU_IMAGE) CREATE_BU_IMAGE="${trimmed_value}" ;;
             SNAPSHOTS) SNAPSHOTS="${trimmed_value}" ;;
             RETENTION_DAYS) RETENTION_DAYS="${trimmed_value}" ;;
             VM_MOUNTPOINT) VM_MOUNTPOINT="${trimmed_value}" ;;
@@ -227,9 +225,6 @@ validate_parameters() {
     fi
 
     if ! check_YN "${VM_BACKUP_PRI_ONLY}" "VM_BACKUP_PRI_ONLY"; then
-        has_error=1
-    fi
-    if ! check_YN "${CREATE_BU_IMAGE}" "CREATE_BU_IMAGE"; then
         has_error=1
     fi
     if ! check_YN "${DEBUG_MODE}" "DEBUG_MODE"; then
@@ -475,17 +470,18 @@ vm_backup() {
     if [[ "${VM_BACKUP_LOCATION}" == /mnt/user/* ]]; then
         log_message "INFO: Backup location is on a user share. Translating path..."
         
-        # 1a.1 & 1a.2: Extract share name and suffix.
+        # 1a.1 & 1a.2: Extract share name and the rest of the path.
         local path_after_user="${VM_BACKUP_LOCATION#/mnt/user/}"
         local backup_share="${path_after_user%%/*}"
-        local backup_share_suffix="${path_after_user#$backup_share}"
-        log_message "INFO: Detected Share: '${backup_share}', Suffix: '${backup_share_suffix}'"
+        log_message "INFO: Detected Share: '${backup_share}', Path Suffix on Share: '${path_after_user}'"
 
         # 1a.3: Check share config file.
         local share_config_file="${SHARES_CONFIG_DIR}/${backup_share}.cfg"
         if [ ! -r "${share_config_file}" ]; then
             log_message "ERROR: Share config file not found or not readable: '${share_config_file}'"
             return 1
+          else
+             log_message "INFO: Found Share Config file: ${share_config_file}"
         fi
 
         # 1a.3a: Validate 'shareInclude' parameter.
@@ -494,13 +490,17 @@ vm_backup() {
         if [ "$(echo "${share_include_lines}" | wc -l)" -ne 1 ]; then
             log_message "ERROR: Expected exactly one 'shareInclude' line in '${share_config_file}', but found $(echo "${share_include_lines}" | wc -l)."
             return 1
+          else
+           log_message "INFO: Extract from Share config, Included disk is: ${share_include_lines}"
         fi
 
         local backup_disk
-        backup_disk=$(echo "${share_include_lines}" | cut -d'=' -f2 | tr -d '"')
+        backup_disk=$(echo "${share_include_lines}" | cut -d'=' -f2 | tr -d '"\r')
         if [[ ! "${backup_disk}" == disk* ]]; then
             log_message "ERROR: 'shareInclude' value in '${share_config_file}' is not in the format 'disk*'. Found: '${backup_disk}'"
             return 1
+           else
+             log_message "INFO: The base filesystem disk is: ${backup_disk}"
         fi
         
         if ! mountpoint -q "/mnt/${backup_disk}"; then
@@ -510,7 +510,7 @@ vm_backup() {
         log_message "INFO: Share config valid. Using physical disk: '${backup_disk}'"
 
         # 1a.4: Set the final physical backup path.
-        vm_disk_backup="/mnt/${backup_disk}${backup_share_suffix}"
+        vm_disk_backup="/mnt/${backup_disk}/${path_after_user}"
 
     else
         log_message "INFO: Backup location is on a direct disk or pool mount."
