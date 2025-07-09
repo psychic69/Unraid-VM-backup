@@ -4,7 +4,9 @@
 VM_SNAPSHOT_LIST=""
 VM_BACKUP_LIST=""
 VM_BACKUP_PRI_ONLY=""
+BACKUP_COMPRESSION=""
 SNAPSHOTS=""
+BACKUPS=""
 RETENTION_DAYS=""
 VM_MOUNTPOINT=""
 VM_BACKUP_MOUNTPOINT=""
@@ -14,6 +16,7 @@ FILESYSTEM_MAX_PCT=""
 SHARES_CONFIG_DIR=""
 DEBUG_MODE=""
 LOG_FILE=""
+DOMAINS_DIR="" # Will be set in Main Execution
 VM_SNAPSHOT_TARGETS="" # Will be populated by determine_vm_targets()
 VM_BACKUP_TARGETS="" # Will be populated by determine_vm_targets()
 
@@ -49,7 +52,9 @@ read_input_file() {
             VM_SNAPSHOT_LIST) VM_SNAPSHOT_LIST="${trimmed_value}" ;;
             VM_BACKUP_LIST) VM_BACKUP_LIST="${trimmed_value}" ;;
             VM_BACKUP_PRI_ONLY) VM_BACKUP_PRI_ONLY="${trimmed_value}" ;;
+            BACKUP_COMPRESSION) BACKUP_COMPRESSION="${trimmed_value}" ;;
             SNAPSHOTS) SNAPSHOTS="${trimmed_value}" ;;
+            BACKUPS) BACKUPS="${trimmed_value}" ;;
             RETENTION_DAYS) RETENTION_DAYS="${trimmed_value}" ;;
             VM_MOUNTPOINT) VM_MOUNTPOINT="${trimmed_value}" ;;
             VM_BACKUP_MOUNTPOINT) VM_BACKUP_MOUNTPOINT="${trimmed_value}" ;;
@@ -91,24 +96,24 @@ file_rotation() {
     done
 
     # --- 2. Snapshot Count Rotation (by count) ---
-    log_message "INFO: Checking snapshot count for pattern '${pattern}' in '${dir}'. Max files to keep: ${max_files}."
+    log_message "INFO: Checking item count for pattern '${pattern}' in '${dir}'. Max files to keep: ${max_files}."
     
     local current_file_count
     current_file_count=$(find "${dir}" -maxdepth 1 -type f -name "${pattern}" | wc -l)
 
     if (( current_file_count > max_files )); then
         local num_to_delete=$((current_file_count - max_files))
-        log_message "INFO: Found ${current_file_count} files, which exceeds snapshot max of ${max_files}. Deleting the ${num_to_delete} oldest file(s)."
+        log_message "INFO: Found ${current_file_count} files, which exceeds max of ${max_files}. Deleting the ${num_to_delete} oldest file(s)."
         
         # List remaining files by modification time (oldest first) and delete the excess.
         find "${dir}" -maxdepth 1 -type f -name "${pattern}" -printf '%T@ %p\n' | sort -n | head -n "${num_to_delete}" | cut -d' ' -f2- | while read -r old_file; do
-            log_message "INFO: Deleting oldest snapshot to meet count limit: '${old_file}'"
+            log_message "INFO: Deleting oldest item to meet count limit: '${old_file}'"
             if ! rm -f "${old_file}"; then
-                log_message "WARNING: Failed to delete old snapshot file '${old_file}'."
+                log_message "WARNING: Failed to delete old item file '${old_file}'."
             fi
         done
     else
-        log_message "INFO: ${current_file_count} file(s) found. No snapshot count rotation needed for pattern '${pattern}'."
+        log_message "INFO: ${current_file_count} file(s) found. No count-based rotation needed for pattern '${pattern}'."
     fi
     return 0
 }
@@ -203,6 +208,10 @@ validate_parameters() {
         log_message "ERROR: SNAPSHOTS must be a non-zero integer. Current value: '${SNAPSHOTS}'"
         has_error=1
     fi
+    if ! [[ "${BACKUPS}" =~ ^[1-9][0-9]*$ ]]; then
+        log_message "ERROR: BACKUPS must be a non-zero integer. Current value: '${BACKUPS}'"
+        has_error=1
+    fi
     if ! [[ "${FILESYSTEM_MAX_PCT}" =~ ^[0-9]+$ ]] || [ "${FILESYSTEM_MAX_PCT}" -gt 100 ]; then
         log_message "ERROR: FILESYSTEM_MAX_PCT must be an integer between 0-100. Current value: '${FILESYSTEM_MAX_PCT}'"
         has_error=1
@@ -225,6 +234,9 @@ validate_parameters() {
     fi
 
     if ! check_YN "${VM_BACKUP_PRI_ONLY}" "VM_BACKUP_PRI_ONLY"; then
+        has_error=1
+    fi
+    if ! check_YN "${BACKUP_COMPRESSION}" "BACKUP_COMPRESSION"; then
         has_error=1
     fi
     if ! check_YN "${DEBUG_MODE}" "DEBUG_MODE"; then
@@ -369,7 +381,7 @@ filesystem_usage_check() {
 # --- Libvirt Backup Function ---
 # Backs up libvirt configuration files and manages snapshot rotation.
 #
-# @uses global LIBVERT_LOCATION, VM_BACKUP_LOCATION, SNAPSHOTS
+# @uses global LIBVERT_LOCATION, VM_BACKUP_LOCATION, BACKUPS
 # @return {integer} 0 for success, 1 for failure.
 libvirt_backup() {
     log_message "INFO: Starting libvirt configuration backup..."
@@ -400,7 +412,7 @@ libvirt_backup() {
     fi
     log_message "INFO: Successfully created backup archive."
 
-    file_rotation "${backup_subdir}" "libvirt-backup-*.tar.gz" "${SNAPSHOTS}" "${RETENTION_DAYS}"
+    file_rotation "${backup_subdir}" "libvirt-backup-*.tar.gz" "${BACKUPS}" "${RETENTION_DAYS}"
     
     log_message "SUCCESS: Libvirt backup completed successfully."
     return 0
@@ -409,32 +421,25 @@ libvirt_backup() {
 # --- VM Snapshot Function ---
 # Creates copy-on-write (reflink) snapshots of VM disk images and rotates them.
 #
-# @uses global VM_MOUNTPOINT, SNAPSHOTS, VM_SNAPSHOT_TARGETS
+# @uses global VM_MOUNTPOINT, SNAPSHOTS, VM_SNAPSHOT_TARGETS, DOMAINS_DIR
 # @return {integer} 0 for success, 1 for failure.
 vm_snapshot() {
     log_message "INFO: Starting VM disk snapshot process..."
-
-    # Safety Check: Ensure the destination filesystem is not too full before starting.
-    if ! filesystem_usage_check "${VM_MOUNTPOINT}" "${FILESYSTEM_MAX_PCT}"; then
-        log_message "ERROR: Filesystem usage check failed for snapshot destination '${VM_MOUNTPOINT}'. Halting snapshot process."
-        return 1
-    fi
-    
-    local domains_dir="${VM_MOUNTPOINT}/domains"
-
-    if [ ! -d "${domains_dir}" ]; then
-        log_message "ERROR: VM domains directory '${domains_dir}' does not exist."
-        return 1
-    fi
 
     if [ -z "${VM_SNAPSHOT_TARGETS}" ]; then
         log_message "INFO: No VMs targeted for snapshot. Skipping snapshot process."
         return 0
     fi
 
+    # Safety Check: Ensure the snapshot VM filesystem is not too full before starting.
+    if ! filesystem_usage_check "${VM_MOUNTPOINT}" "${FILESYSTEM_MAX_PCT}"; then
+        log_message "ERROR: Filesystem usage check failed for snapshot destination '${VM_MOUNTPOINT}'. Halting snapshot process."
+        return 1
+    fi
+
     # Loop through the list of VMs determined by vm_snapshot_targets.
     while IFS= read -r vm_name; do
-        local vm_dir="${domains_dir}/${vm_name}"
+        local vm_dir="${DOMAINS_DIR}/${vm_name}"
         if [ ! -d "${vm_dir}" ]; then
             log_message "WARNING: Directory for VM '${vm_name}' not found at '${vm_dir}'. Skipping."
             continue
@@ -469,105 +474,186 @@ vm_snapshot() {
 }
 
 # --- VM Backup Function ---
-# Prepares and validates the backup location for VM disk images.
+# Prepares and validates the backup location and determines disk images to back up.
 #
 # @return {integer} 0 for success, 1 for failure.
 vm_backup() {
-    log_message "INFO: --- Preparing for VM Backup ---"
+    log_message "INFO: --- Starting VM Backup Process ---"
     
     if [ -z "${VM_BACKUP_TARGETS}" ]; then
         log_message "INFO: No VMs targeted for backup. Skipping backup process."
         return 0
     fi
 
-    local vm_disk_backup=""
+    local vm_disk_backup_base=""
 
-    # 1. Determine and validate the physical backup path.
+    # --- Preparation Stage ---
+    log_message "INFO: Preparing and validating backup destination..."
     if [[ "${VM_BACKUP_LOCATION}" == /mnt/user/* ]]; then
-        log_message "INFO: Backup location is on a user share. Translating path..."
-        
-        # 1a.1 & 1a.2: Extract share name and the rest of the path.
+        log_message "INFO: VM Backup location is on a user share. Translating path..."
         local path_after_user="${VM_BACKUP_LOCATION#/mnt/user/}"
         local backup_share="${path_after_user%%/*}"
         log_message "INFO: Detected Share: '${backup_share}', Path Suffix on Share: '${path_after_user}'"
-
-        # 1a.3: Check share config file.
         local share_config_file="${SHARES_CONFIG_DIR}/${backup_share}.cfg"
         if [ ! -r "${share_config_file}" ]; then
             log_message "ERROR: Share config file not found or not readable: '${share_config_file}'"
             return 1
-          else
-             log_message "INFO: Found Share Config file: ${share_config_file}"
         fi
-
-        # 1a.3a: Validate 'shareInclude' parameter.
         local share_include_lines
         share_include_lines=$(grep '^shareInclude=' "${share_config_file}")
         if [ "$(echo "${share_include_lines}" | wc -l)" -ne 1 ]; then
             log_message "ERROR: Expected exactly one 'shareInclude' line in '${share_config_file}', but found $(echo "${share_include_lines}" | wc -l)."
             return 1
-          else
-           log_message "INFO: Extract from Share config, Included disk is: ${share_include_lines}"
         fi
-
         local backup_disk
         backup_disk=$(echo "${share_include_lines}" | cut -d'=' -f2 | tr -d '"\r')
         if [[ ! "${backup_disk}" == disk* ]]; then
             log_message "ERROR: 'shareInclude' value in '${share_config_file}' is not in the format 'disk*'. Found: '${backup_disk}'"
             return 1
         fi
-        
-        if ! mountpoint -q "/mnt/${backup_disk}"; then
-            log_message "ERROR: The included disk '${backup_disk}' is not mounted at '/mnt/${backup_disk}'."
+        if ! mount_check "/mnt/${backup_disk}"; then
+            log_message "ERROR: The physical disk '${backup_disk}' for the share is not a valid mount point."
             return 1
         fi
         log_message "INFO: Share config valid. Using physical disk: '${backup_disk}'"
-
-        # 1a. 4: Filesystem final check
-        if ! mount_check "/mnt/${backup_disk}"; then
-        log_message "ERROR: The final physical backup path '${vm_disk_backup}' is not a usable xfs or btrfs mount point."
-        return 1
-        fi
-
-        # 1a.4: Set the final physical backup path.
-        vm_disk_backup="/mnt/${backup_disk}/${path_after_user}"
-
+        vm_disk_backup_base="/mnt/${backup_disk}/${path_after_user}"
     else
         log_message "INFO: Backup location is on a direct disk or pool mount."
-        # 1b.1: Check if the mount point is valid.
         if ! mount_check "${VM_BACKUP_MOUNTPOINT}"; then
              log_message "ERROR: The specified VM_BACKUP_MOUNTPOINT '${VM_BACKUP_MOUNTPOINT}' is not a valid btrfs or xfs mount."
              return 1
         fi
-        # 1b.2: Set the final backup path.
-        vm_disk_backup="${VM_BACKUP_LOCATION}"
+        vm_disk_backup_base="${VM_BACKUP_LOCATION}"
     fi
 
-    log_message "INFO: Final physical backup path set to: '${vm_disk_backup}'"
-
-    # 3. Check if directory exists and is writable.
-    if ! mkdir -p "${vm_disk_backup}"; then
-        log_message "ERROR: Failed to create backup directory '${vm_disk_backup}'."
+    log_message "INFO: Final physical backup base path set to: '${vm_disk_backup_base}'"
+    
+    # Create and validate the main /backups subdirectory
+    local main_backup_dir="${vm_disk_backup_base}/backups"
+    if ! mkdir -p "${main_backup_dir}"; then
+        log_message "ERROR: Failed to create main backup directory '${main_backup_dir}'."
         return 1
     fi
-    if [ ! -w "${vm_disk_backup}" ]; then
-        log_message "ERROR: Backup directory '${vm_disk_backup}' is not writable."
+    if [ ! -w "${main_backup_dir}" ]; then
+        log_message "ERROR: Main backup directory '${main_backup_dir}' is not writable."
         return 1
     fi
-    log_message "INFO: Backup directory is accessible and writable."
+    log_message "INFO: Main backup directory is accessible and writable."
 
-    # 4. Check filesystem usage against the safety threshold.
-    if ! filesystem_usage_check "${vm_disk_backup}" "${FILESYSTEM_MAX_PCT}"; then
-        log_message "ERROR: Filesystem usage check failed. Halting backup to prevent filling the disk."
-        return 1
+    # --- Execution Stage ---
+    declare -a vm_backup_array
+    
+    # 1. Populate the array of VMs and disks to be backed up.
+    log_message "INFO: Identifying disk images for targeted VMs..."
+    if [[ "$VM_BACKUP_PRI_ONLY" == "Y" ]]; then
+        log_message "INFO: This backup job is configured to back up the primary disk image only."
     fi
 
-    log_message "SUCCESS: VM Backup preparation stage completed successfully."
+    while IFS= read -r vm_name; do
+        local virsh_xml
+        virsh_xml=$(virsh dumpxml "$vm_name" --inactive 2>/dev/null)
+        if [ -z "$virsh_xml" ]; then
+            log_message "WARN: Could not get XML for VM '$vm_name'. It may not exist. Skipping."
+            continue
+        fi
+        local image_tuples
+        image_tuples=$(echo "$virsh_xml" | awk 'BEGIN { RS="</disk>" } /type='\''file'\''/ && /device='\''disk'\''/ { boot_order = 99; if (match($0, /<boot order='\''([0-9]+)'\''\/>/, b)) { boot_order = b[1] } if (match($0, /<source file='\''([^'\'']+\.img)'\''/, s)) { print boot_order, s[1] } }')
+        if [[ -z "$image_tuples" ]]; then
+            log_message "WARN: No suitable '*.img' disk files found for VM '$vm_name'."
+            continue
+        fi
+        local sorted_full_paths
+        sorted_full_paths=$(echo "$image_tuples" | sort -n | cut -d' ' -f2-)
+        local paths_to_process
+        if [[ "$VM_BACKUP_PRI_ONLY" == "Y" ]]; then
+            paths_to_process=$(echo "$sorted_full_paths" | head -n 1)
+        else
+            paths_to_process="$sorted_full_paths"
+        fi
+        local basenames
+        basenames=$(echo "$paths_to_process" | xargs -n 1 basename)
+        local image_list
+        image_list=$(echo "$basenames" | tr '\n' ' ')
+        image_list=${image_list% } 
+        if [[ -n "$image_list" ]]; then
+            vm_backup_array+=("$vm_name $image_list")
+        fi
+    done <<< "${VM_BACKUP_TARGETS}"
+
+    if [ ${#vm_backup_array[@]} -eq 0 ]; then
+        log_message "INFO: No valid disks found for any targeted VMs. Skipping backup execution."
+        return 0
+    fi
+
+    # 2. Process each VM and its disks from the generated array.
+    for item in "${vm_backup_array[@]}"; do
+        local vm_name
+        vm_name=$(echo "$item" | awk '{print $1}')
+        local image_list
+        image_list=$(echo "$item" | awk '{$1=""; print $0}' | xargs)
+        
+        local vm_backup_dest_dir="${main_backup_dir}/${vm_name}"
+        log_message "INFO: Preparing backup directory for ${vm_name} at '${vm_backup_dest_dir}'"
+        if ! mkdir -p "${vm_backup_dest_dir}"; then
+            log_message "ERROR: Failed to create backup directory for ${vm_name}. Skipping."
+            continue
+        fi
+        if [ ! -w "${vm_backup_dest_dir}" ]; then
+            log_message "ERROR: Backup directory for ${vm_name} is not writable. Skipping."
+            continue
+        fi
+
+        for disk_basename in $image_list; do
+            local source_disk_path="${DOMAINS_DIR}/${vm_name}/${disk_basename}"
+            if [ ! -f "${source_disk_path}" ]; then
+                log_message "WARNING: Source disk image not found at '${source_disk_path}'. Skipping."
+                continue
+            fi
+            
+            local timestamp
+            timestamp=$(date '+%Y%m%d%H%M%S')
+            local temp_reflink_path="${DOMAINS_DIR}/${vm_name}/temp-${timestamp}-${disk_basename}"
+            
+            log_message "INFO: Creating temporary reflink of '${source_disk_path}'"
+            if ! cp -p --reflink=always "${source_disk_path}" "${temp_reflink_path}"; then
+                log_message "ERROR: Failed to create temporary reflink for '${disk_basename}'. Skipping disk."
+                continue
+            fi
+
+            if [[ "$BACKUP_COMPRESSION" == "Y" ]]; then
+                local dest_backup_file="${vm_backup_dest_dir}/${timestamp}-${disk_basename}.zst"
+                log_message "INFO: Compressing '${temp_reflink_path}' to '${dest_backup_file}'"
+                if ! zstd -f "${temp_reflink_path}" -o "${dest_backup_file}"; then
+                    log_message "ERROR: Failed to compress backup for '${disk_basename}'. Cleaning up."
+                    rm -f "${temp_reflink_path}"
+                    rm -f "${dest_backup_file}" # Clean up partial file
+                    continue
+                fi
+                file_rotation "${vm_backup_dest_dir}" "*-${disk_basename}.zst" "${BACKUPS}" "${RETENTION_DAYS}"
+            else
+                local dest_backup_file="${vm_backup_dest_dir}/${timestamp}-${disk_basename}"
+                log_message "INFO: Copying (rsync) '${temp_reflink_path}' to '${dest_backup_file}'"
+                if ! rsync -aP --delete "${temp_reflink_path}" "${dest_backup_file}"; then
+                    log_message "ERROR: Failed to rsync backup for '${disk_basename}'. Cleaning up."
+                    rm -f "${temp_reflink_path}"
+                    rm -f "${dest_backup_file}" # Clean up partial file
+                    continue
+                fi
+                file_rotation "${vm_backup_dest_dir}" "*-${disk_basename}" "${BACKUPS}" "${RETENTION_DAYS}"
+            fi
+            
+            log_message "INFO: Cleaning up temporary reflink: ${temp_reflink_path}"
+            rm -f "${temp_reflink_path}"
+        done
+    done
+
+    log_message "SUCCESS: VM Backup execution completed."
     return 0
 }
 
-
-# --- Main Execution ---
+#########################
+# --- Main Execution ---#
+#########################
 
 # Step 1: Read configuration from INI file. This must happen before logging is set up.
 if ! read_input_file; then
@@ -586,7 +672,17 @@ if ! validate_parameters; then
     exit 1
 fi
 
-# Step 4: Determine which VMs to process for snapshots and backups.
+# Step 4: Pre-flight check for required commands
+if ! command -v virsh &> /dev/null; then
+    log_message "ERROR: 'virsh' command not found. Please ensure libvirt client is installed. Aborting."
+    exit 1
+fi
+if ! command -v zstd &> /dev/null; then
+    log_message "ERROR: 'zstd' command not found. Please ensure zstd is installed. Aborting."
+    exit 1
+fi
+
+# Step 5: Determine which VMs to process for snapshots and backups.
 if ! determine_vm_targets "VM_SNAPSHOT_TARGETS" "${VM_SNAPSHOT_LIST}" "snapshot"; then
     log_message "ERROR: Failed to determine valid VM snapshot targets. Aborting script."
     exit 1
@@ -604,13 +700,19 @@ if ! mount_check "${VM_MOUNTPOINT}"; then
 fi
 log_message "Mount point check passed successfully."
 
+log_message "--- Checking for VM Domains Directory ---"
+DOMAINS_DIR="${VM_MOUNTPOINT}/domains"
+if [ ! -d "${DOMAINS_DIR}" ]; then
+    log_message "ERROR: VM domains directory '${DOMAINS_DIR}' does not exist. Check VM_MOUNTPOINT: ${VM_MOUNTPOINT}. Halting script."
+    exit 1
+fi
+log_message "INFO: VM domains directory found at '${DOMAINS_DIR}'."
 
 log_message "--- Running Libvirt Backup ---"
 if ! libvirt_backup; then
     log_message "ERROR: Libvirt backup failed. Please review the log file."
 fi
 log_message "Libvirt backup completed successfully."
-
 
 log_message "--- Running VM Snapshot ---"
 if ! vm_snapshot; then
