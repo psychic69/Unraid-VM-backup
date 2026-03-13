@@ -2,6 +2,16 @@
 
 A comprehensive Bash-based backup solution for managing virtual machines (VMs) on Unraid systems. This script automates the creation of snapshots, backups, and libvirt configuration preservation with intelligent retention and rotation policies.
 
+## Quick Start
+
+1. **Place the script and parameters.ini in the same directory** on your Unraid server
+2. **Edit parameters.ini** with your paths and preferences (see Configuration section)
+3. **Make the script executable**: `chmod +x script`
+4. **Run the script**: `./script`
+5. **Check the logs**: `tail -f /mnt/thegate/backup-vm/logs/backup-*.log`
+
+That's it! The script will handle snapshots, backups, and libvirt configs automatically.
+
 ## Features
 
 - **VM Snapshots**: Creates reflink (copy-on-write) snapshots of VM disk images for quick point-in-time copies
@@ -41,7 +51,10 @@ A comprehensive Bash-based backup solution for managing virtual machines (VMs) o
 - Includes pre-operation check to ensure filesystem isn't too full
 
 #### VM Backups (`vm_backup()`)
-- Identifies backup target location (handles Unraid shares, unassigned disks, and cache pools)
+- Intelligently identifies backup target location and routing:
+  - **User Share** (`/mnt/user/*`): Attempts to find the physical disk backing the share via Unraid config
+  - **Direct Disk/Cache Pool** (other paths): Uses the mount point directly
+  - **Fallback Behavior**: If share config exists but has empty `shareInclude`, gracefully falls back to using the share path directly
 - Optionally backs up only the primary disk (first boot device) or all disks
 - Creates temporary reflinks of disk images for safe backup operations
 - **With Compression (`BACKUP_COMPRESSION=Y`)**:
@@ -61,6 +74,37 @@ The `file_rotation()` function manages both snapshot and backup retention using 
 2. **Count-Based Rotation**: Keeps only the most recent N files (based on modification time)
 
 This dual approach ensures you never exceed your count limits while also enforcing a minimum age threshold.
+
+## Backup Location Routing
+
+The script intelligently handles different backup location types automatically:
+
+### 1. Cache Pool or Unassigned Disk (Recommended)
+**Example**: `VM_BACKUP_LOCATION="/mnt/thegate/backup-vm"`
+
+- Script detects the path is NOT a user share (doesn't start with `/mnt/user/`)
+- Validates that `VM_BACKUP_MOUNTPOINT` (`/mnt/thegate`) is a proper btrfs or XFS mount
+- Uses the path directly for all backups and logs
+- **Advantages**: Simple, fast, no FUSE layer, predictable behavior
+
+### 2. User Share with Physical Disk Assignment
+**Example**: `VM_BACKUP_LOCATION="/mnt/user/backup-vm"`
+
+- Script detects the path is a user share (starts with `/mnt/user/`)
+- Reads the share config from `/boot/config/shares/backup-vm.cfg`
+- Extracts the physical disk from the `shareInclude` field (e.g., `disk1`)
+- Redirects backups to the physical disk path to bypass FUSE layer
+- **Advantages**: Uses Unraid's share management while avoiding FUSE overhead
+
+### 3. User Share WITHOUT Physical Disk Assignment (Fallback)
+**Example**: `VM_BACKUP_LOCATION="/mnt/user/backup-vm"` but `shareInclude` is empty
+
+- Script detects the path is a user share
+- Attempts to read share config but finds empty `shareInclude` field
+- **Gracefully falls back** to using the user share path directly
+- Logs a warning but continues with backup operation
+- **Behavior**: Still works, but may use FUSE layer
+- **Solution**: Configure the share in Unraid UI to assign a physical disk for better performance
 
 ## Configuration (parameters.ini)
 
@@ -88,10 +132,10 @@ All settings are defined in `parameters.ini`, located in the same directory as t
 | Parameter | Type | Example | Description |
 |-----------|------|---------|-------------|
 | `VM_MOUNTPOINT` | Path | `/mnt/nvme_vm_cache` | Mount point where VMs are stored (must be btrfs or XFS with reflink) |
-| `VM_BACKUP_MOUNTPOINT` | Path | `/mnt/user/backup-vm` | Physical mount point for backup validation (used if backup location is on a share) |
+| `VM_BACKUP_MOUNTPOINT` | Path | `/mnt/thegate` | Physical mount point for backup validation. This should be the root of your backup destination (disk, cache pool, or array). Script validates that this path is a valid btrfs or XFS mount. |
 | `LIBVERT_LOCATION` | Path | `/etc/libvirt` | Directory containing libvirt configuration files to back up |
-| `VM_BACKUP_LOCATION` | Path | `/mnt/user/backup-vm` | Base directory where backups and logs are stored |
-| `SHARES_CONFIG_DIR` | Path | `/boot/config/shares` | Directory containing Unraid share configuration files (for share analysis) |
+| `VM_BACKUP_LOCATION` | Path | `/mnt/thegate/backup-vm` | Base directory where backups, logs, and libvirt backups are stored. Can be a user share (`/mnt/user/...`), unassigned disk, or cache pool. |
+| `SHARES_CONFIG_DIR` | Path | `/boot/config/shares` | Directory containing Unraid share configuration files (for share analysis). Only used if `VM_BACKUP_LOCATION` is on a user share. |
 
 ### Safety Settings
 
@@ -109,33 +153,43 @@ All settings are defined in `parameters.ini`, located in the same directory as t
 
 After running the backup script, your backup location will have this structure:
 
+### Example with Cache Pool (`/mnt/thegate/backup-vm`)
+
 ```
-{VM_BACKUP_LOCATION}/
+/mnt/thegate/backup-vm/
 ├── logs/
-│   ├── backup-2025-02-10_143022.log
-│   ├── backup-2025-02-10_153045.log
+│   ├── backup-2026-03-10_074513.log
+│   ├── backup-2026-03-10_083022.log
 │   └── ...
-└── libvirt/
-    ├── libvirt-backup-2025-02-10_143022.tar.gz
-    ├── libvirt-backup-2025-02-10_153045.tar.gz
+├── libvirt/
+│   ├── libvirt-backup-2026-03-10_074513.tar.gz
+│   ├── libvirt-backup-2026-03-10_083022.tar.gz
+│   └── ...
+└── backups/
+    ├── ubuntu-vm/
+    │   ├── 20260310074513-vdisk1.img.zst    # Compressed backup (if BACKUP_COMPRESSION=Y)
+    │   ├── 20260309074513-vdisk1.img.zst
+    │   └── ...
+    ├── windows-vm/
+    │   ├── 20260310074513-vdisk1.img.zst
+    │   ├── 20260309074513-vdisk1.img.zst
+    │   └── ...
     └── ...
+```
 
-{VM_MOUNTPOINT}/domains/
-├── vm1/
-│   ├── vdisk1.img                           # Original primary disk
-│   ├── vdisk1.img_snapshot_20250210143022.fullsnap  # Snapshot
-│   ├── vdisk2.img                           # Secondary disk
-│   └── ...
-├── vm2/
-│   └── ...
-└── ...
+### VM Source Snapshots (`/mnt/nvme_vm_cache/domains/`)
 
-{VM_BACKUP_LOCATION}/backups/
-├── vm1/
-│   ├── 20250210143022-vdisk1.img.zst        # Compressed backup (if BACKUP_COMPRESSION=Y)
-│   ├── 20250209143022-vdisk1.img.zst
+```
+/mnt/nvme_vm_cache/domains/
+├── ubuntu-vm/
+│   ├── vdisk1.img                                    # Original primary disk
+│   ├── vdisk1.img_snapshot_20260310074513.fullsnap  # Reflink snapshot
+│   ├── vdisk1.img_snapshot_20260309074513.fullsnap
+│   ├── vdisk2.img                                    # Secondary disk
 │   └── ...
-├── vm2/
+├── windows-vm/
+│   ├── vdisk1.img
+│   ├── vdisk1.img_snapshot_20260310074513.fullsnap
 │   └── ...
 └── ...
 ```
@@ -236,14 +290,57 @@ Filename format: `backup-YYYY-MM-DD_HHMMSS.log`
 View the most recent log:
 
 ```bash
-tail -f /mnt/user/backup-vm/logs/backup-*.log | sort -r | head -1 | xargs tail -f
+tail -f /mnt/thegate/backup-vm/logs/backup-*.log | sort -r | head -1 | xargs tail -f
 ```
 
-Or list all backups:
+Or list all logs:
 
 ```bash
-ls -lh /mnt/user/backup-vm/logs/
+ls -lh /mnt/thegate/backup-vm/logs/
 ```
+
+View a specific log file:
+
+```bash
+cat /mnt/thegate/backup-vm/logs/backup-2026-03-10_074513.log
+```
+
+## Configuring Unraid Shares for Backups
+
+If you prefer to use an Unraid user share for backups instead of a direct cache pool path:
+
+### Step 1: Create or Configure the Share in Unraid UI
+
+1. Go to **Shares** → **backup-vm** (or create a new share)
+2. Click **Edit** to open the share settings
+3. Under **Disk Share Assignment**, assign the share to a specific disk or cache pool:
+   - Select the target from the dropdown (e.g., "disk1", cache pool name, etc.)
+   - This populates the `shareInclude` field in the share config file
+4. Click **Save**
+
+### Step 2: Update parameters.ini
+
+```ini
+VM_BACKUP_LOCATION="/mnt/user/backup-vm"
+VM_BACKUP_MOUNTPOINT="/mnt/user"
+```
+
+### Step 3: Run the Script
+
+The script will now:
+1. Detect that the location is a user share
+2. Read the share config to find the physical disk
+3. Bypass the FUSE layer by using the direct disk path
+4. Store backups on the physical disk for maximum performance
+
+### Fallback Behavior
+
+If the share config lacks a `shareInclude` value (empty disk assignment):
+- The script logs a **WARNING** message
+- Continues with the backup using the share path directly
+- No manual intervention needed, but performance may be slightly reduced
+
+**To fix this**: Assign a disk to the share in Unraid UI (see Step 1 above)
 
 ## Troubleshooting
 
@@ -282,6 +379,13 @@ ls -lh /mnt/user/backup-vm/logs/
 **Error**: "Failed to create snapshot"
 - **Solution**: Ensure filesystem supports reflink (btrfs or XFS with reflink=1)
 - Test: `cp --reflink=always {source} {test_dest}`
+
+**Warning**: "shareInclude is empty in config file. Falling back to share path."
+- **Status**: This is now handled gracefully (v1.1+)
+- **What's happening**: Your backup location is a user share, but it doesn't have a physical disk assigned
+- **Solution (Optional but Recommended)**: Assign a disk to the share in Unraid UI for better performance (see "Configuring Unraid Shares for Backups" section)
+- **Backup Status**: Backups will still work using the share path directly, but may be slightly slower due to FUSE layer
+- **Verification**: Check logs for `WARNING: 'shareInclude' is empty` message
 
 ## Performance Considerations
 
@@ -354,10 +458,12 @@ RETENTION_DAYS="7"
 
 1. **Pre-execution Validation**: All parameters checked before any operations
 2. **Filesystem Monitoring**: Checks disk usage before backup operations
-3. **Reflink Support Verification**: Ensures filesystem supports required features
+3. **Reflink Support Verification**: Ensures filesystem supports required features (btrfs or XFS with reflink)
 4. **Temporary File Cleanup**: Removes temporary files even on failure
 5. **Atomic Operations**: Uses copy-on-write for safe snapshots
 6. **Error Logging**: All errors logged with context for debugging
+7. **Graceful Fallback**: If backup location is a user share but config is incomplete, falls back to using the share path directly instead of failing
+8. **Mount Point Validation**: Verifies backup destination mount point before proceeding with operations
 
 ## License & Support
 
@@ -365,5 +471,11 @@ Designed for Unraid VM backup automation. For issues or improvements, review the
 
 ## Version History
 
+- **v1.1** (Current):
+  - Added graceful fallback for empty `shareInclude` values in Unraid share configs
+  - Improved error messages and debug logging for share config issues
+  - Enhanced documentation for backup location routing and configuration options
+  - Features: reflink snapshots, compression, rotation, Unraid share support with fallback
+
 - **v1.0**: Initial release with snapshot, backup, and libvirt backup support
-- Features: reflink snapshots, compression, rotation, Unraid share support
+  - Features: reflink snapshots, compression, rotation, basic Unraid share support

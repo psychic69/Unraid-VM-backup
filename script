@@ -506,17 +506,27 @@ vm_backup() {
             return 1
         fi
         local backup_disk
-        backup_disk=$(echo "${share_include_lines}" | cut -d'=' -f2 | tr -d '"\r')
-        if [[ ! "${backup_disk}" == disk* ]]; then
-            log_message "ERROR: 'shareInclude' value in '${share_config_file}' is not in the format 'disk*'. Found: '${backup_disk}'"
-            return 1
+        # Extract the value after '=', remove quotes and carriage returns, and trim whitespace
+        backup_disk=$(echo "${share_include_lines}" | cut -d'=' -f2 | tr -d '"\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+        # Check if shareInclude is empty and fall back to share path
+        if [[ -z "${backup_disk}" ]]; then
+            log_message "WARNING: 'shareInclude' is empty in '${share_config_file}'. Falling back to share path."
+            log_message "INFO: Using share path directly: '${VM_BACKUP_LOCATION}'"
+            vm_disk_backup_base="${VM_BACKUP_LOCATION}"
+        else
+            # Validate that the extracted disk is in the correct format
+            if [[ ! "${backup_disk}" == disk* ]]; then
+                log_message "ERROR: 'shareInclude' value in '${share_config_file}' is not in the format 'disk*'. Found: '${backup_disk}'"
+                return 1
+            fi
+            if ! mount_check "/mnt/${backup_disk}"; then
+                log_message "ERROR: The physical disk '${backup_disk}' for the share is not a valid mount point."
+                return 1
+            fi
+            log_message "INFO: Share config valid. Using physical disk: '${backup_disk}'"
+            vm_disk_backup_base="/mnt/${backup_disk}/${path_after_user}"
         fi
-        if ! mount_check "/mnt/${backup_disk}"; then
-            log_message "ERROR: The physical disk '${backup_disk}' for the share is not a valid mount point."
-            return 1
-        fi
-        log_message "INFO: Share config valid. Using physical disk: '${backup_disk}'"
-        vm_disk_backup_base="/mnt/${backup_disk}/${path_after_user}"
     else
         log_message "INFO: Backup location is on a direct disk or pool mount."
         if ! mount_check "${VM_BACKUP_MOUNTPOINT}"; then
