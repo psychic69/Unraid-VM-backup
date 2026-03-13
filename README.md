@@ -387,6 +387,12 @@ If the share config lacks a `shareInclude` value (empty disk assignment):
 - **Backup Status**: Backups will still work using the share path directly, but may be slightly slower due to FUSE layer
 - **Verification**: Check logs for `WARNING: 'shareInclude' is empty` message
 
+**Error/Issue**: "Deleting file due to retention policy" immediately after backup creation
+- **Status**: Fixed in v1.2
+- **What was happening**: When using `cp -p --reflink` to create temporary backup files, the original disk image's modification time (weeks/months old) was preserved. When zstd compressed the file, it retained this old timestamp. The rotation function would see the newly created backup as being weeks old and immediately delete it.
+- **Current behavior**: After backup compression, the file's modification time is updated to the current time via `touch` command, ensuring rotation works correctly
+- **Previous versions**: If you're using v1.1 or earlier and seeing this issue, upgrade to v1.2 or manually run `touch /mnt/thegate/backup-vm/backups/*/\*.zst` to fix existing backup timestamps
+
 ## Performance Considerations
 
 ### Snapshot Performance
@@ -471,7 +477,13 @@ Designed for Unraid VM backup automation. For issues or improvements, review the
 
 ## Version History
 
-- **v1.1** (Current):
+- **v1.2** (Current):
+  - **CRITICAL FIX**: Fixed backup file rotation bug where newly created backups were immediately deleted
+  - Root cause: `cp -p` preserved original disk image's old modification time, causing zstd-compressed backups to appear weeks old to the rotation function
+  - Solution: Added `touch` command after backup completion to update file modification time to current time
+  - Applied fix to both compressed (zstd) and uncompressed (rsync) backup paths
+
+- **v1.1**:
   - Added graceful fallback for empty `shareInclude` values in Unraid share configs
   - Improved error messages and debug logging for share config issues
   - Enhanced documentation for backup location routing and configuration options

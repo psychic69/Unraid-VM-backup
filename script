@@ -640,6 +640,10 @@ vm_backup() {
                     rm -f "${dest_backup_file}" # Clean up partial file
                     continue
                 fi
+                # Update the modification time of the compressed file to current time so rotation works correctly
+                if ! touch "${dest_backup_file}"; then
+                    log_message "WARNING: Failed to update modification time for '${dest_backup_file}', rotation may behave unexpectedly."
+                fi
                 file_rotation "${vm_backup_dest_dir}" "*-${disk_basename}.zst" "${BACKUPS}" "${RETENTION_DAYS}"
             else
                 local dest_backup_file="${vm_backup_dest_dir}/${timestamp}-${disk_basename}"
@@ -649,6 +653,10 @@ vm_backup() {
                     rm -f "${temp_reflink_path}"
                     rm -f "${dest_backup_file}" # Clean up partial file
                     continue
+                fi
+                # Update the modification time of the backup file to current time so rotation works correctly
+                if ! touch "${dest_backup_file}"; then
+                    log_message "WARNING: Failed to update modification time for '${dest_backup_file}', rotation may behave unexpectedly."
                 fi
                 file_rotation "${vm_backup_dest_dir}" "*-${disk_basename}" "${BACKUPS}" "${RETENTION_DAYS}"
             fi
