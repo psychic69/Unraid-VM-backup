@@ -27,7 +27,8 @@ VM_BACKUP_TARGETS="" # Will be populated by determine_vm_targets()
 read_input_file() {
     # Determine the script's directory to find the INI file.
     local script_dir
-    script_dir=$(dirname "$(readlink -f "$0")")
+    # script_dir=$(dirname "$(readlink -f "$0")") , note must hardcode for user scripts plugin since readlink -f is not available in unraid's busybox
+    script_dir="/boot/config/plugins/user.scripts/scripts/2025vmbackup"
     local ini_file="${script_dir}/parameters.ini"
 
     if [ ! -r "${ini_file}" ]; then
